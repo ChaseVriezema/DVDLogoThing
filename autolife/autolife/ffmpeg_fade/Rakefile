@@ -1,0 +1,146 @@
+#command:
+#rake create_video -- --source=./preview-video-iphone-x-split-1.mov --times=00:00:00-00:00:10,00:00:20-00:00:30,00:00:40-00:00:50
+
+
+require 'optparse'
+
+#--times=00:03-00:17,00:38-00:44
+#--times=01:22-01:37,02:06-02:21
+#--times=02:29-03:07
+
+#clean method to remove unused files
+def clean remove_file, options
+    if(options[:clean].to_s == "true")
+        execute "rm #{remove_file}"
+    end
+end
+
+#length method to find the amount of seconds between two times
+def length_in_seconds start_time_as_string, end_time_as_string
+  a = start_time_as_string.split(":").last.to_i
+  b = end_time_as_string.split(":").last.to_i
+  b = b + 60 if b < a
+  (a - b)  * -1
+end
+
+#method to parse the input times
+def parse_time_definition times
+  result = {
+    times: []
+  }
+
+  result[:times] = times.split(',').map do |token|
+    start_t = token.split('-').first
+    end_t = token.split('-').last
+    { start: start_t,
+      end: end_t,
+      length_in_seconds: length_in_seconds(start_t, end_t) }
+  end
+
+  result[:total_time] = result[:times].map { |s| s[:length_in_seconds] }.inject(:+)
+  result
+end
+
+#task to parse the input times
+task :parse_times do
+  options = {}
+
+  o = OptionParser.new do |opts|
+    opts.on("-s SOURCE", "--source SOURCE", String) { |source| options[:source] = source }
+    opts.on("-t TIMES", "--times TIMES", String) { |times| options[:times] = times }
+  end
+
+  args = o.order!(ARGV) {}
+  o.parse!(args)
+  time_definition = parse_time_definition(options[:times])
+  puts time_definition
+
+  if(time_definition[:total_time] > 28)
+    percentage = 28.fdiv(time_definition[:total_time])
+    puts percentage
+  end
+end
+
+#execute a command in the terminal
+def execute command
+  puts command
+  sh command
+end
+
+#change the length of the video -- WIP
+def change_video_speed input_file, output_file, current_seconds, target_seconds
+  if(current_seconds > target_seconds)
+    execute "ffmpeg -i final-pre-speed-up.mov -vcodec h264 -an -vf \"fps=30, setpts=(#{target_seconds}/#{current_seconds})*PTS\" #{output_file.gsub(".mov", "_no_audio.mov")}"
+    execute "ffmpeg -f lavfi -i anullsrc=channel_layout=stereo:sample_rate=44100 -i #{output_file.gsub(".mov", "_no_audio.mov")} -shortest -c:v copy -c:a aac #{output_file}"
+  else
+    execute "ffmpeg -i final-pre-speed-up.mov -vcodec h264 -vf \"fps=30, setpts=1.0*PTS\" #{output_file}"
+  end
+end
+
+#stitch together a set of clips via fade transition
+def add_fade_transition time_definition, options
+  time = 0;
+  num = 0;
+  prev = "";
+  time_definition[:times].each do |t|
+    if num == 0
+        time = t[:length_in_seconds]
+        prev = "video_0.mov"
+        num = 1
+    else
+        execute"ffmpeg -i #{prev} -i video_#{num}.mov -f lavfi -i color=black -filter_complex \
+        \"[0:v]format=pix_fmts=yuva420p,fade=t=out:st=#{time-1}:d=1:alpha=1,setpts=PTS-STARTPTS[va0];\
+        [1:v]format=pix_fmts=yuva420p,fade=t=in:st=0:d=1:alpha=1,setpts=PTS-STARTPTS+#{time-1}/TB[va1];\
+        [2:v]scale=#{options[:resolution]},trim=duration=#{time-1+t[:length_in_seconds]}[over];\
+        [over][va0]overlay[over1]; \
+        [over1][va1]overlay=format=yuv420[outv]\" \\
+        -vcodec libx264 -map [outv] out_#{num}.mov"
+        clean "#{prev}", options
+        clean "video_#{num}.mov", options
+        prev = "out_#{num}.mov"
+        num = num + 1;
+        time = time + t[:length_in_seconds]
+    end
+  end
+  execute "ffmpeg -i out_#{num-1}.mov -vf scale=#{options[:resolution]} #{options[:output]}"
+  clean "out_#{num}.mov", options
+end
+
+#split apart a video and stitch it back toegether via fade transition
+task :create_video do
+  options = { output: 'final.mov' }
+
+  o = OptionParser.new do |opts|
+    opts.on("-s SOURCE", "--source SOURCE", String) { |source| options[:source] = source }
+    opts.on("-t TIMES",  "--times TIMES", String) { |times| options[:times] = times }
+    opts.on("-r RESOLTUION", "--resolution RESOLUTION", String) { |resolution| options[:resolution] = resolution }
+    opts.on("-c CLEAN", "--clean CLEAN", String) { |clean| options[:clean] = clean }
+    opts.on("-o OUTPUT", "--output OUTPUT", String) { |output| options[:output] = output }
+  end
+
+  args = o.order!(ARGV) {}
+  o.parse!(args)
+  
+  Dir.chdir('./preview-videos') do
+    time_definition = parse_time_definition(options[:times])
+    if time_definition[:total_time] > 28
+        puts "Time is greater than 28 seconds"
+        raise "Time is too long"
+    end
+    num = 0
+    files_created = []
+    execute "ffmpeg -i #{options[:source]} -vf scale=#{options[:resolution]} final-pre-speed-up.mov"   #ipad-pro-biggest
+    
+    time_definition[:times].map do |t|
+      file_name = "video_" + num.to_s
+      files_created << "#{file_name}.mov"
+
+      sh "ffmpeg -i final-pre-speed-up.mov -ss #{t[:start]} -t #{t[:length_in_seconds]} -async 1 #{file_name}.mov"
+
+      num += 1
+    end
+    clean "final-pre-speed-up.mov", options
+    add_fade_transition time_definition, options
+    #change_video_speed 'final-pre-speed-up.mov', options[:output], time_definition[:total_time], 28
+  end
+end
